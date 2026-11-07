@@ -20,6 +20,8 @@ _SIMULATIONS = {3: 420, 4: 650, 5: 900}
 _RIVER_EXACT_MAX_OPPONENTS = 1
 _MAX_RECENT_HANDS = 60
 _MAX_SHOWDOWNS = 60
+_PROFILE_WARMUP_HANDS = 100
+_MIN_FOLD_TO_CBET_OPPORTUNITIES = 12
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -62,6 +64,10 @@ def _new_profile() -> dict[str, Any]:
         "river_bet_opportunities": 0,
         "river_bets": 0,
         "aggressive_actions": 0,
+        "raise_actions": 0,
+        "all_in_raises": 0,
+        "all_in_showdowns": 0,
+        "weak_all_in_showdowns": 0,
         "passive_actions": 0,
         "calls": 0,
         "checks": 0,
@@ -236,6 +242,8 @@ class Model:
             "river_bet_opportunities": 0,
             "river_bets": 0,
             "aggressive_actions": 0,
+            "raise_actions": 0,
+            "all_in_raises": 0,
             "passive_actions": 0,
             "calls": 0,
             "checks": 0,
@@ -299,7 +307,10 @@ class Model:
             if is_hero:
                 self._observe_hero_action(kind, street)
             else:
-                self._observe_opponent_action(pid, kind, street, int(action.amount))
+                all_in_raise = kind == "raise" and game_state.stacks[pid] == 0
+                self._observe_opponent_action(
+                    pid, kind, street, int(action.amount), all_in_raise
+                )
 
     def _observe_hero_action(self, kind: str, street: str):
         if street == "preflop":
@@ -326,9 +337,12 @@ class Model:
                         self._waiting_for_fold_to_cbet.add(opp)
 
     def _observe_opponent_action(self, pid: int, kind: str, street: str,
-                                 amount: int = 0):
+                                 amount: int = 0, all_in_raise: bool = False):
         hs = self._hand_stats.setdefault(pid, self._new_hand_stats())
         hs["street_actions"][street] += 1
+        if kind == "raise":
+            hs["raise_actions"] += 1
+            hs["all_in_raises"] += int(all_in_raise)
         first_action_this_street = pid not in self._street_first_action
         self._street_first_action.add(pid)
 
@@ -379,7 +393,9 @@ class Model:
                 hs["vpip"] = True
                 hs["pfr"] = True
                 hs["raise_sizes"].append({"street": street, "total": int(amount)})
-                self._opponent_preflop_action[pid] = "raise"
+                self._opponent_preflop_action[pid] = (
+                    "shove" if all_in_raise else "raise"
+                )
                 self._preflop_raise_count += 1
                 self._preflop_aggressor = pid
                 self._last_preflop_raiser = pid
@@ -444,7 +460,7 @@ class Model:
 
         if kind == "raise" and street == "preflop":
             hs["aggressive_actions"] += 1
-        observed_action = kind
+        observed_action = "shove" if all_in_raise else kind
         if street != "preflop" and kind == "call":
             # In this API call() also represents a check when nothing is owed.
             observed_action = "call" if self._street_has_bet else "check"
@@ -476,8 +492,8 @@ class Model:
                 "flop_bet_opportunities", "flop_bets",
                 "turn_bet_opportunities", "turn_bets",
                 "river_bet_opportunities", "river_bets",
-                "aggressive_actions", "passive_actions", "calls",
-                "checks", "folds",
+                "aggressive_actions", "raise_actions", "all_in_raises",
+                "passive_actions", "calls", "checks", "folds",
             ):
                 profile[key] += hs[key]
 
@@ -495,6 +511,8 @@ class Model:
             revealed = hs["revealed_cards"]
             if len(revealed) >= 2:
                 profile["showdowns"] += 1
+                if hs["all_in_raises"]:
+                    profile["all_in_showdowns"] += 1
                 won = hs["won"] > 0
                 profile["showdown_wins"] += int(won)
                 try:
@@ -516,6 +534,8 @@ class Model:
                 profile["showdown_history"] = profile["showdown_history"][-_MAX_SHOWDOWNS:]
                 if category is not None and category <= 1:
                     profile["weak_showdowns"] += 1
+                    if hs["all_in_raises"]:
+                        profile["weak_all_in_showdowns"] += 1
 
             recent_entry = {
                 "vpip": bool(hs["vpip"]),
@@ -523,6 +543,7 @@ class Model:
                 "rfi": bool(hs["rfi"]),
                 "limp": bool(hs["limp"]),
                 "raises": hs["aggressive_actions"],
+                "all_in_raises": hs["all_in_raises"],
                 "calls": hs["calls"],
                 "checks": hs["checks"],
                 "folds": hs["folds"],
@@ -551,8 +572,19 @@ class Model:
         profile = self._profile(player_id)
         return _rate(profile.get(numerator, 0), profile.get(denominator, 0), prior)
 
+    def _opponent_is_frequent_shover(self, player_id: int) -> bool:
+        """Require repeated all-in raises before treating shoves as a pattern."""
+        profile = self._profile(player_id)
+        raises = profile.get("raise_actions", 0)
+        shoves = profile.get("all_in_raises", 0)
+        return raises >= 3 and shoves / raises >= 0.75
+
     def _opponent_fold_to_cbet(self, player_id: int) -> float:
         profile = self._profile(player_id)
+        # Ignore sparse historical reads during warm-up. Equity calculations
+        # still run; this gates only the profile-based exploit estimate.
+        if profile.get("hands", 0) < _PROFILE_WARMUP_HANDS:
+            return 0.45
         lifetime = _rate(
             profile.get("fold_to_cbet", 0),
             profile.get("fold_to_cbet_opportunities", 0),
@@ -581,18 +613,24 @@ class Model:
         )
 
         hands = profile.get("hands", 0)
-        vpip = _rate(profile.get("vpip_hands", 0), hands, prior=0.65)
-        pfr = _rate(profile.get("pfr_hands", 0), hands, prior=0.30)
-        recent = profile.get("recent", [])[-25:]
-        if len(recent) >= 5:
-            recent_vpip = _rate(sum(bool(x.get("vpip")) for x in recent),
-                                len(recent), prior=vpip)
-            recent_pfr = _rate(sum(bool(x.get("pfr")) for x in recent),
-                               len(recent), prior=pfr)
-            vpip = 0.55 * vpip + 0.45 * recent_vpip
-            pfr = 0.55 * pfr + 0.45 * recent_pfr
+        profile_mature = hands >= _PROFILE_WARMUP_HANDS
+        # Use population priors until there are 100 completed hands against
+        # this team. Actions observed in the current hand still condition range.
+        vpip = 0.65
+        pfr = 0.30
+        if profile_mature:
+            vpip = _rate(profile.get("vpip_hands", 0), hands, prior=0.65)
+            pfr = _rate(profile.get("pfr_hands", 0), hands, prior=0.30)
+            recent = profile.get("recent", [])[-25:]
+            if len(recent) >= 5:
+                recent_vpip = _rate(sum(bool(x.get("vpip")) for x in recent),
+                                    len(recent), prior=vpip)
+                recent_pfr = _rate(sum(bool(x.get("pfr")) for x in recent),
+                                   len(recent), prior=pfr)
+                vpip = 0.55 * vpip + 0.45 * recent_vpip
+                pfr = 0.55 * pfr + 0.45 * recent_pfr
 
-        if self._hand_button is not None:
+        if profile_mature and self._hand_button is not None:
             pos_name = "button" if player_id == self._hand_button else "big_blind"
             pos = profile.get("position", {}).get(pos_name, {})
             pos_hands = pos.get("hands", 0)
@@ -603,9 +641,23 @@ class Model:
                 pfr = 0.65 * pfr + 0.35 * pos_pfr
 
         weight = 1.0
-        if pre_action == "raise":
+        if pre_action in ("raise", "shove"):
             exponent = 1.35 if pfr > 0.30 else 1.8
-            weight *= 0.22 + 1.65 * (pre_strength ** exponent)
+            action_weight = 0.22 + 1.65 * (pre_strength ** exponent)
+            if (pre_action == "shove"
+                    and self._opponent_is_frequent_shover(player_id)):
+                # Repeated jams are less informative about hand strength than
+                # a one-off shove. Blend the strong-range weight toward neutral.
+                blend = 0.40
+                shown = profile.get("all_in_showdowns", 0)
+                if shown >= 3:
+                    weak_rate = _rate(
+                        profile.get("weak_all_in_showdowns", 0), shown,
+                        prior=0.20,
+                    )
+                    blend = _clamp(0.35 + 0.40 * weak_rate, 0.35, 0.65)
+                action_weight = (1.0 - blend) * action_weight + blend
+            weight *= action_weight
         elif pre_action == "call":
             target = _clamp(0.30 + 0.28 * vpip, 0.35, 0.62)
             weight *= 0.35 + 1.15 * (1.0 - abs(pre_strength - target))
@@ -618,16 +670,34 @@ class Model:
             except Exception:
                 made_strength = 0.35
 
-            if last_action == "raise":
-                weak_showdown_rate = _rate(
-                    profile.get("weak_showdowns", 0),
-                    profile.get("showdowns", 0),
-                    prior=0.18,
+            if last_action in ("raise", "shove"):
+                weak_showdown_rate = (
+                    _rate(
+                        profile.get("weak_showdowns", 0),
+                        profile.get("showdowns", 0),
+                        prior=0.18,
+                    )
+                    if profile_mature else 0.18
                 )
                 # Weak revealed hands can be evidence of wider aggression,
                 # but are not automatically classified as bluffs.
                 weak_hand_floor = _clamp(0.12 + 0.18 * weak_showdown_rate, 0.12, 0.24)
-                weight *= weak_hand_floor + (1.0 - weak_hand_floor) * (made_strength ** 1.35)
+                action_weight = (
+                    weak_hand_floor
+                    + (1.0 - weak_hand_floor) * (made_strength ** 1.35)
+                )
+                if (last_action == "shove"
+                        and self._opponent_is_frequent_shover(player_id)):
+                    blend = 0.40
+                    shown = profile.get("all_in_showdowns", 0)
+                    if shown >= 3:
+                        weak_rate = _rate(
+                            profile.get("weak_all_in_showdowns", 0), shown,
+                            prior=0.20,
+                        )
+                        blend = _clamp(0.35 + 0.40 * weak_rate, 0.35, 0.65)
+                    action_weight = (1.0 - blend) * action_weight + blend
+                weight *= action_weight
             elif last_action == "call":
                 weight *= 0.42 + 1.05 * made_strength
             elif last_action == "check":
@@ -766,6 +836,19 @@ class Model:
             if score >= 0.64 and game_state.can_raise:
                 return self._raise_increment(game_state, 1.05)
             call_threshold = 0.29 + 0.13 * game_state.pot_odds
+            opponent_shoved = any(
+                action == "shove"
+                for pid, action in self._opponent_preflop_action.items()
+                if pid != me
+            )
+            frequent_shover = any(
+                self._opponent_is_frequent_shover(pid)
+                for pid in self._opponent_id_to_name
+            )
+            if opponent_shoved and frequent_shover:
+                # Widen calls modestly against a repeatedly observed jammer;
+                # pot odds still matter and this is not an automatic call.
+                call_threshold = max(0.18, call_threshold - 0.06)
             if score >= call_threshold:
                 return PlayerAction.call(me)
             return PlayerAction.fold(me)
@@ -791,7 +874,21 @@ class Model:
 
         # Against an actual bet, compare equity against the price of calling.
         if call_amount > 0:
+            opponent_shoved = (
+                opponent_id is not None
+                and self._opponent_last_action_by_street.get(opponent_id, {}).get(
+                    game_state.street
+                ) == "shove"
+            )
+            frequent_shover = (
+                opponent_id is not None
+                and self._opponent_is_frequent_shover(opponent_id)
+            )
             margin = 0.025 if len(game_state.board) < 5 else 0.012
+            if opponent_shoved and frequent_shover:
+                # Don't require extra equity above the price against a known
+                # frequent jammer, but never call below estimated pot odds.
+                margin = 0.0
             if equity > pot_odds + margin:
                 # Raise strong value hands; do not turn routine bluff-catchers
                 # into raises without a specific exploitative reason.
@@ -810,10 +907,9 @@ class Model:
             self._opponent_fold_to_cbet(opponent_id)
             if opponent_id is not None else 0.45
         )
-        cbet_sample = (
-            self._profile(opponent_id).get("fold_to_cbet_opportunities", 0)
-            if opponent_id is not None else 0
-        )
+        opponent_profile = self._profile(opponent_id) if opponent_id is not None else {}
+        cbet_sample = opponent_profile.get("fold_to_cbet_opportunities", 0)
+        mature_profile = opponent_profile.get("hands", 0) >= _PROFILE_WARMUP_HANDS
         is_preflop_aggressor = self._preflop_aggressor == me
         is_button = me == game_state.button
 
@@ -828,7 +924,8 @@ class Model:
 
         # Exploit a demonstrated tendency to fold to flop bets, but require a
         # reasonable sample and avoid bluffing every weak holding.
-        if (board_count == 3 and opponent_id is not None and cbet_sample >= 6
+        if (board_count == 3 and opponent_id is not None and mature_profile
+                and cbet_sample >= _MIN_FOLD_TO_CBET_OPPORTUNITIES
                 and fold_to_cbet >= 0.62 and equity >= 0.24):
             return self._raise_increment(game_state, 0.30)
 
